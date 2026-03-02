@@ -1,9 +1,13 @@
-FROM grafana/loki:latest
+# Stage 1: Get the Loki binary from the official image
+FROM grafana/loki:latest AS loki
 
-USER root
+# Stage 2: Alpine base with shell, nginx, and Loki
+FROM alpine:latest
 
-# Install nginx and envsubst
 RUN apk add --no-cache nginx gettext
+
+# Copy Loki binary from official image
+COPY --from=loki /usr/bin/loki /usr/bin/loki
 
 # Copy configs
 COPY loki-config.yaml /etc/loki/loki-config.yaml
