@@ -14,8 +14,10 @@ fi
 # Render nginx config with env vars
 envsubst '${PORT} ${AUTH_TOKEN}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
 
-# Start Loki in the background
-/usr/bin/loki -config.file=/etc/loki/loki-config.yaml &
+# Start Loki in the background.
+# `-config.expand-env=true` lets the YAML reference Railway env vars via
+# `${VAR}` syntax (used for the S3 credentials/endpoint/bucket).
+/usr/bin/loki -config.file=/etc/loki/loki-config.yaml -config.expand-env=true &
 
 # Wait for Loki to be ready
 echo "Waiting for Loki to start..."
