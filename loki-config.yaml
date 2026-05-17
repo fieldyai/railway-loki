@@ -73,16 +73,15 @@ limits_config:
   max_entries_limit_per_query: 50000
   allow_structured_metadata: true
   discover_service_name: []
-  # Query parallelism. After fieldy-observe #19 dropped the mobile body-
-  # grep sweep, `correlate user` only issues one Loki query per call, but
-  # sub-queries still serialize at querier.max_concurrent. With max_
-  # concurrent=32 a 24h range (144 sub-queries from split=10m) needs ~5
-  # rounds, and Loki query log showed sub-queries spending 8-11s in
-  # queue_time while the container sat near-idle on CPU/RAM. Bump the
-  # whole stack so the frontend is allowed to fan out, and the queriers
-  # are allowed to actually serve in parallel. Safe at these levels
-  # because chunks are S3-only — fetches are non-blocking HTTP, no OS-
-  # thread pin risk like the 2026-04-20 incident.
+  # Frontend fan-out caps. These bound the queue depth the query
+  # frontend will produce per range query — they do NOT control
+  # concurrent execution (that's querier.max_concurrent below) and do
+  # NOT participate in the memory pressure that OOMed #11. Queued sub-
+  # query state is KBs each, completed results buffered for merge are
+  # a few KB each. tsdb_max_query_parallelism=256 was actively
+  # constraining 7d range queries (1008 sub-queries → 4 sequential
+  # frontend rounds); 1024 lets them queue all at once. max_query_
+  # parallelism is the per-tenant cap; uniform with the tsdb knob.
   split_queries_by_interval: 10m
   max_query_parallelism: 256          # default 32
   tsdb_max_query_parallelism: 1024    # default 128
@@ -127,13 +126,14 @@ pattern_ingester:
 
 querier:
   # Default is 10. With chunks S3-only, chunk fetches are non-blocking
-  # HTTP and don't pin OS threads. Was 32; bumped to 128 because the
-  # query log showed sub-queries queueing 8-11s while CPU/RAM sat idle.
-  # Peak in-flight S3 GETs is bounded by this value; Tigris handles
-  # 100s/sec comfortably so 128 concurrent is well clear of any rate
-  # limit. Goroutine count goes up but Go scheduler is fine — the OS-
-  # thread cap from the filesystem-chunk era no longer applies.
-  max_concurrent: 128
+  # HTTP and don't pin OS threads. Was 32; #11 jumped to 128 and OOMed
+  # the 32 GB container — each in-flight metadata-sweep sub-query holds
+  # ~150-250 MB of decoded chunks + structured metadata, so 128 ×
+  # ~200 MB ≈ 25 GB peak query memory + baseline blew past the limit.
+  # 64 is the safe halfway: query log showed queue_time of 8-11s at
+  # max_concurrent=32, this cuts it ~in half while staying well clear
+  # of OOM (64 × ~200 MB ≈ 13 GB peak in 32 GB container).
+  max_concurrent: 64
 
 ingester:
   # Mobile log uploads arrive with capture-time timestamps that can lag
