@@ -22,6 +22,7 @@ envsubst '${PORT} ${AUTH_TOKEN}' < /etc/nginx/nginx.conf.template > /etc/nginx/n
 #   16 workers x <=2.2 GB (1 GB split cap x ~2.2 heap per processed byte,
 #   measured 2026-09-12) = 35 GB, + 2 GB results cache + ~2 GB baseline
 #   = 39 GB < GOMEMLIMIT 44 GiB < 59.6 GiB cgroup limit.
+#   Load test with three concurrent 6h three-service queries: RSS 39.6 GiB.
 LOKI_QUERIER_MAX_CONCURRENT="${LOKI_QUERIER_MAX_CONCURRENT:-16}"
 LOKI_MAX_QUERY_PARALLELISM="${LOKI_MAX_QUERY_PARALLELISM:-16}"
 LOKI_TSDB_MAX_QUERY_PARALLELISM="${LOKI_TSDB_MAX_QUERY_PARALLELISM:-64}"

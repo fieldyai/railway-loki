@@ -230,8 +230,10 @@ querier:
   #   GOMEMLIMIT                    44 GiB (47 GB), set in entrypoint.sh
   #   cgroup memory.max             59.6 GiB (64,000,000,000 bytes)
   #
-  # Throughput at 16: ~120 MB/s per worker measured → ~2 GB/s, so a 6h
-  # three-service correlate (26 GB) returns in ~13s instead of crashing.
+  # Load test 2026-09-12 (three concurrent 6h three-service correlates,
+  # 78 GB processed): RSS peak 39.6 GiB, heap 34.7 GiB, answers in 42 s,
+  # 83 s and 105 s, 0 chunk-load errors. The old config died on the same
+  # pattern.
   max_concurrent: ${LOKI_QUERIER_MAX_CONCURRENT}
 
 ingester:
