@@ -1,5 +1,6 @@
 # Stage 1: Get the Loki binary from the official image
-FROM grafana/loki:latest AS loki
+# Pinned: `latest` rebuilt the image onto whatever Loki shipped that day.
+FROM grafana/loki:3.7.7 AS loki
 
 # Stage 2: Alpine base with shell, nginx, and Loki
 FROM alpine:latest

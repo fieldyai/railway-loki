@@ -4,8 +4,9 @@ dockerfilePath = "Dockerfile"
 
 [deploy]
 numReplicas = 1
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 10
+restartPolicyType = "ALWAYS"
+healthcheckPath = "/ready"
+healthcheckTimeout = 300
 
 [volumes]
 data = "/loki"

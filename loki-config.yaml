@@ -52,11 +52,19 @@ common:
         insecure: false
         http:
           # Default is 1m30s. 5m keeps connections alive across consecutive
-          # correlate sub-query batches in the same session. The Thanos
-          # client defaults max_idle_connections / max_idle_connections_per_host
-          # to 100, which fits our max_concurrent=64 querier budget — no
-          # explicit override needed.
+          # correlate sub-query batches in the same session.
           idle_conn_timeout: 5m
+          # Thanos defaults: 100 idle, unlimited total. Under 48 workers x 150
+          # parallel chunk GETs the client opened thousands of short-lived TLS
+          # connections and the kernel ran out of ephemeral ports: 327
+          # "connect: cannot assign requested address" chunk-load failures in
+          # the 40 minutes after the 2026-09-12 restart, surfacing as 500s.
+          # 1024 >= 16 workers x 32 parallel GETs (below) + compactor/flush, so
+          # every connection is reused and the hard cap makes callers wait
+          # instead of opening more.
+          max_idle_connections: 1024
+          max_idle_connections_per_host: 1024
+          max_connections_per_host: 1024
   replication_factor: 1
   ring:
     kvstore:
@@ -69,6 +77,10 @@ storage_config:
   # block above. Same bucket, same objects, same chunk format — purely a
   # client library swap. Rollback is `git revert` + redeploy.
   use_thanos_objstore: true
+  # Default 150 parallel chunk GETs per query. With 16 workers that is up to
+  # 2400 in-flight S3 requests; 32 keeps the total (512) inside the
+  # connection pool above so no request has to open a fresh connection.
+  max_parallel_get_chunk: 32
   # Note on index caches: TSDB index does not use a server-side query cache
   # (`index_queries_cache_config`) — Loki docs explicitly state caching is not
   # required for TSDB. The TSDB shipper handles local disk caching via
@@ -106,12 +118,11 @@ query_range:
     cache:
       embedded_cache:
         enabled: true
-        # Default is ~1GB. Was 100MB → 1024MB → 4096MB → 8192MB. 8GB cuts
-        # cold sub-query rate on dashboard reloads. Cheap at 64GB container
-        # size: today's 20-query 7d storm test peaked at 5GB query memory,
-        # so query workload + 8GB cache + ~10GB baseline ≈ ~23GB total
-        # under heavy load — comfortable inside the 64GB ceiling.
-        max_size_mb: 8192
+        # 8192 → 2048 (2026-09-12). loki_embeddedcache_memory_bytes for
+        # frontend.embedded-cache read 77 KB after 40 minutes of mixed
+        # traffic; the 8 GB was reserved headroom taken from the query
+        # budget for no measured benefit.
+        max_size_mb: 2048
 
 limits_config:
   # 60-day retention. Compactor below actually enforces it (the previous
@@ -133,40 +144,32 @@ limits_config:
   # default — stated explicitly so the truncate behavior is self-documenting.
   max_line_size: 256KB
   max_line_size_truncate: true
-  # Per-query parallelism caps. These bound how many sub-queries one
-  # query can fan out at the frontend; `querier.max_concurrent` below is
-  # the global execution cap that ultimately gates how many run at once.
-  #
-  # 2026-05-20: the values these revert FROM (256 / 1024, set in PR #11)
-  # let a single wide query monopolize all worker slots at the then-bumped
-  # `max_concurrent: 128`. Combined with `max_concurrent` walking back to
-  # 86 but these knobs staying at the bump, normal mixed dashboard +
-  # correlate traffic was pushing committed memory past 54 GB and tripping
-  # GOMEMLIMIT's GC brake (the "Loki chokes" symptom). Loki docs label
-  # these as the per-request fan-out cap; restoring them to roughly
-  # default × 2 sizing matches the resource footprint (64 GB / 32 vCPU
-  # container).
-  #
-  # `max_query_parallelism: 64` — at our `max_concurrent: 64` (also
-  # env-tunable below), one query CAN use every slot when nothing else is
-  # competing → fast interactive correlate; with multi-query load the
-  # global cap fair-shares between queries naturally.
-  #
-  # `tsdb_max_query_parallelism: 256` — purely a frontend dispatch cap;
-  # the queue is KB-sized per sub-query, so 256 just lets a 7d query
-  # queue all its sub-queries in fewer frontend rounds. No memory cost
-  # because `max_concurrent` still gates execution.
+  # Per-query fan-out caps. `max_query_parallelism` equals
+  # `querier.max_concurrent` so one interactive query can use every worker
+  # when idle and the global cap fair-shares under load.
+  # `tsdb_max_query_parallelism` is only a frontend dispatch cap (KB-sized
+  # queue entries), 4x the worker count is enough to keep the queue full.
   split_queries_by_interval: 10m
-  max_query_parallelism: ${LOKI_MAX_QUERY_PARALLELISM}             # default 64
-  tsdb_max_query_parallelism: ${LOKI_TSDB_MAX_QUERY_PARALLELISM}   # default 256
-  # THE missing OOM guardrail: max_query_bytes_read defaulted to 0 (disabled),
-  # so catch-all sweeps (`{service=~".+"} | user_id=...`, ~0.5GB per 10m split
-  # × hundreds of splits) executed until the kernel killed the process — every
-  # exit-137 in the 07-15..18 window. With a cap, Loki estimates cost from
-  # index stats and rejects with a 400 before execution. 200GB ≈ 2-3d of
-  # match-all traffic; 8GB/split is ~16× the observed worst case.
-  max_query_bytes_read: ${LOKI_MAX_QUERY_BYTES_READ}               # default 200GB
-  max_querier_bytes_read: ${LOKI_MAX_QUERIER_BYTES_READ}           # default 8GB
+  max_query_parallelism: ${LOKI_MAX_QUERY_PARALLELISM}             # default 16
+  tsdb_max_query_parallelism: ${LOKI_TSDB_MAX_QUERY_PARALLELISM}   # default 64
+  # Byte caps are estimated from index stats and enforced with a 400 before
+  # execution; they do not apply to filter-less log queries (those are
+  # bounded by max_entries_limit_per_query instead).
+  #
+  # `max_querier_bytes_read` is the per-worker memory bound and the number
+  # the whole budget hangs on. Measured 2026-09-12: one 10m split of
+  # `{service=~"^(fieldy-mobile|fieldy-app-api|fieldy-core-api)$"} | user_id=".."`
+  # processed 717 MB (360 MB of it structured metadata) and held ~1.4 GB of
+  # heap, i.e. ~2.2 bytes of heap per processed byte. The old 8 GB cap
+  # allowed 17 GB per worker; 48 workers pushed heap to 69 GiB and the
+  # kernel killed the process (exit 137, 8 restarts in the prior 7 days).
+  # 1 GB caps a worker at ~2.2 GB; tsdb_max_bytes_per_shard (600 MB
+  # default) shards anything bigger first, so legit queries rarely see it.
+  #
+  # `max_query_bytes_read` 50 GB ≈ 6h of the three busiest services or 5d
+  # of one; wider asks must narrow the selector or the window.
+  max_query_bytes_read: ${LOKI_MAX_QUERY_BYTES_READ}               # default 50GB
+  max_querier_bytes_read: ${LOKI_MAX_QUERIER_BYTES_READ}           # default 1GB
   # Default 721h made explicit and sized to the 60d retention.
   max_query_length: 1441h
   otlp_config:
@@ -213,30 +216,24 @@ pattern_ingester:
   enabled: true
 
 querier:
-  # Default 10; Loki docs recommend ~16 for TSDB single-binary on
-  # standard hardware. History: 32 → 128 (#11, OOM) → 64 (#13) → 96
-  # (#17) → 86 (#23) → 64 (this PR).
+  # History: 32 → 128 (#11, OOM) → 64 (#13) → 96 (#17) → 86 (#23) → 48
+  # (#27) → 16 (2026-09-12). Every value above 16 has OOM-killed the
+  # container at least once; the per-worker working set was always
+  # underestimated because structured metadata is decoded into heap
+  # alongside the lines. 16 is also the Loki docs' recommendation for a
+  # TSDB single binary. Budget with the 1 GB split cap above:
   #
-  # Why 64 lands here: at 86 the storm and normal-but-concurrent
-  # dashboard+correlate traffic was pushing committed heap past 54 GB
-  # and tripping GOMEMLIMIT's GC brake. Workers held ~450-530 MB/slot
-  # under realistic load (much higher than the original ~78 MB estimate
-  # because of structured-metadata fetches). Math at 64:
+  #   workers        16 × ≤2.2 GB ≈ 35 GB (typical ≈ 1.4 GB → 22 GB)
+  #   results_cache               ≈  2 GB
+  #   baseline (idle RSS 1.1 GiB) ≈  2 GB
+  #   worst case                  ≈ 39 GB
+  #   GOMEMLIMIT                    44 GiB (47 GB), set in entrypoint.sh
+  #   cgroup memory.max             59.6 GiB (64,000,000,000 bytes)
   #
-  #   workers       64 × ~450 MB ≈ 29 GB
-  #   results_cache              ≈  8 GB
-  #   baseline                   ≈  5 GB
-  #   committed peak             ≈ 42 GB
-  #   GC headroom in 64 GB       ≈ 22 GB
-  #   GOMEMLIMIT (58 GiB ≈ 62 GB) margin ≈ 20 GB
-  #
-  # Sized at ~4× the Loki-recommended 16 because the container is ~4×
-  # the typical single-binary recipe (64 GB / 32 vCPU vs the docs'
-  # ~16 GB / 8 vCPU).
-  #
-  # 2026-07-19: default 64 → 48. The OOM kills ran with an env override
-  # of 70: 70 × ~0.6GB working set ≈ 42GB of query heap alone — no
-  # headroom left. Secondary guard; the byte caps above are primary.
+  # Load test 2026-09-12 (three concurrent 6h three-service correlates,
+  # 78 GB processed): RSS peak 39.6 GiB, heap 34.7 GiB, answers in 42 s,
+  # 83 s and 105 s, 0 chunk-load errors. The old config died on the same
+  # pattern.
   max_concurrent: ${LOKI_QUERIER_MAX_CONCURRENT}
 
 ingester:
